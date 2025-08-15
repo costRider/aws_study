@@ -65,8 +65,8 @@ $grid.Columns.Add("Dir","Service Directory")   | Out-Null
 $grid.Columns.Add("Repo","Git Repo URL")       | Out-Null
 
 # 샘플 2행
-$grid.Rows.Add(@("i-xxxxxxxxweb01","/home/ec2-user/ssd_day2_h2baseapp","https://github.com/<org>/ssd_day2_h2baseapp.git"))|Out-Null
-$grid.Rows.Add(@("i-xxxxxxxxweb02","/home/ec2-user/swu_stresstest_example","https://github.com/<org>/swu_stresstest_example.git"))|Out-Null
+$grid.Rows.Add(@("i-xxxxxxxxweb01","/home/ec2-user/ssd_day2_h2baseapp","https://github.com/dev-library/sd_day2_h2baseapp.git"))|Out-Null
+$grid.Rows.Add(@("i-xxxxxxxxweb02","/home/ec2-user/swu_stresstest_example","https://github.com/dev-library/swu_stresstest_example.git"))|Out-Null
 
 $lblLog = New-Object System.Windows.Forms.Label
 $lblLog.Text = "Log:"
