@@ -1,0 +1,17 @@
+# Window
+Host	bastion
+	Hostname 15.164.99.116
+	User ec2-user
+	IdentityFile "C:\Users\insul\.ssh\mkkey_aws.pem"
+
+Host	web01
+	Hostname 10.0.68.153
+	User ec2-user
+	IdentityFile "C:\Users\insul\.ssh\mkkey_aws.pem"
+	ProxyCommand	ssh.exe bastion -W %h:%p
+	
+Host	web02
+	Hostname 10.0.86.215
+	User ec2-user
+	IdentityFile "C:\Users\insul\.ssh\mkkey_aws.pem"
+	ProxyCommand	ssh.exe bastion -W %h:%p

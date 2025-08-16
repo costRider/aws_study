@@ -1,0 +1,30 @@
+인스턴스 접속용 키페어 발급 및 저장
+
+VPC 생성 
+서브넷 생성(public, private)
+인터넷 게이트웨이 VPC와 연결
+NAT G/W 생성하여 public에 달기(각자 공인 IP부여 - 외부통신 위함)
+라우팅 테이블 작성 public subnet용, private subnet용(public은 인터넷게이트웨이, private는 public nat)
+public subnet 에 bastion 서버 생성(private 접근용)
+private subnet에 web01,02 생성 
+
+
+--aws linux 에 git 설치
+
+sudo dnf(or yum) install git -y
+
+--aws linux에 java 17 설치
+
+sudo dnf(or yum) install java-17-amazon-corretto-devel
+
+-- git repo
+https://github.com/dev-library/sd_day2_h2baseapp.git
+https://github.com/dev-library/swu_stresstest_example.git
+
+-- workspace
+/home/ec2-user/ssd_day2_h2baseapp
+/home/ec2-user/swu_stresstest_example
+
+i-05798de1ae690bd8c
+
+i-0e87df379bc205640
