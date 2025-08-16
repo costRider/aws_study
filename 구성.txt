@@ -24,7 +24,3 @@ https://github.com/dev-library/swu_stresstest_example.git
 -- workspace
 /home/ec2-user/ssd_day2_h2baseapp
 /home/ec2-user/swu_stresstest_example
-
-i-05798de1ae690bd8c
-
-i-0e87df379bc205640
