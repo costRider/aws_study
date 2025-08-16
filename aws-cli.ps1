@@ -2,6 +2,17 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# 1) 모듈 준비 (최초 1회만)
+$modules = @("AWS.Tools.Common","AWS.Tools.SimpleSystemsManagement")
+foreach ($m in $modules) {
+  if (-not (Get-Module -ListAvailable -Name $m)) {
+    Install-Module $m -Scope CurrentUser -Force -AllowClobber
+  }
+}
+
+Import-Module AWS.Tools.Common
+Import-Module AWS.Tools.SimpleSystemsManagement
+
 # ---------- UI ----------
 $form                  = New-Object System.Windows.Forms.Form
 $form.Text             = "AWS Rolling Update (SSM) GUI"
@@ -118,61 +129,176 @@ function Run-Cli($argsArray) {
 }
 
 function Build-EnsureStartScript([string]$dir,[string]$repo,[int]$port,[string]$healthPath) {
-@"
+$tpl = @'
+#!/usr/bin/env bash
 set -euxo pipefail
-PKG="dnf"; command -v dnf >/dev/null 2>&1 || PKG="yum"
-sudo \$PKG -y install git curl || true
-if ! command -v java >/dev/null 2>&1; then
-  if [ "\$PKG" = "dnf" ]; then sudo dnf -y install java-17-amazon-corretto-devel
-  else sudo amazon-linux-extras enable java-openjdk17 || true; sudo yum -y install java-17-amazon-corretto-devel; fi
-fi
-if [ ! -d "$dir" ]; then
-  mkdir -p "$dir"; git clone "$repo" "$dir"
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# 1. 소스 디렉토리 준비
+if [ ! -d "__DIR__" ]; then
+  mkdir -p "__DIR__"
+  git clone "__REPO__" "__DIR__"
 else
-  if [ -d "$dir/.git" ]; then cd "$dir"; git fetch --all || true
-  else rm -rf "$dir"/*; git clone "$repo" "$dir"; fi
+  if [ -d "__DIR__/.git" ]; then
+    cd "__DIR__"
+    git fetch --all || true
+    git reset --hard origin/$(git rev-parse --abbrev-ref HEAD) || true
+  else
+    rm -rf "__DIR__"/*
+    git clone "__REPO__" "__DIR__"
+  fi
 fi
-cd "$dir"; chmod +x ./gradlew || true
-if [ -f app.pid ]; then kill \$(cat app.pid) || true; rm -f app.pid; fi
+
+cd "__DIR__"
+chmod +x ./gradlew || true
+
+# 2. 기존 프로세스 종료
+if [ -f app.pid ]; then
+  kill $(cat app.pid) || true
+  rm -f app.pid
+fi
+
 if command -v ss >/dev/null 2>&1; then
-  PID=\$(ss -tlnp | awk '/:$port / {print \$NF}' | sed 's/.*pid=//;s/,.*//')
-  [ -n "\$PID" ] && kill \$PID || true
-else pkill -f 'gradle.*bootRun' || true; fi
-nohup bash -lc "./gradlew --no-daemon bootRun > app.log 2>&1 & echo \$! > app.pid" || exit 1
+  PID=$(ss -tlnp 2>/dev/null | awk -v p=":__PORT__" '$0 ~ p {print $NF}' | sed -E 's/.*pid=([0-9]+).*/\1/')
+  [ -n "$PID" ] && kill $PID || true
+else
+  pkill -f "gradle.*bootRun" || true
+fi
+
+# 3. 새 프로세스 기동
+nohup ./gradlew --no-daemon bootRun > app.log 2>&1 & echo $! > app.pid
+
+# 4. 헬스체크 (최대 3분)
 for i in {1..60}; do
-  if curl -fsS "http://127.0.0.1:$port$healthPath" | grep -qi 'UP\|200\|ok'; then echo HEALTH_OK; exit 0; fi
+  HTTP=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:__PORT____HEALTH__" || true)
+  if [ "$HTTP" = "200" ]; then
+    echo "HEALTH_OK (200)"
+    exit 0
+  fi
   sleep 3
 done
-echo HEALTH_TIMEOUT; exit 2
-"@
+
+echo "HEALTH_TIMEOUT (last=$HTTP)"
+exit 2
+'@
+
+# 플레이스홀더 치환
+$tpl = $tpl.Replace('__DIR__', $dir)
+$tpl = $tpl.Replace('__REPO__', $repo)
+$tpl = $tpl.Replace('__PORT__', [string]$port)
+$tpl = $tpl.Replace('__HEALTH__', $healthPath)
+
+return $tpl
 }
 
-function Invoke-SSM([string]$region,[string]$iid,[string]$commands,[string]$comment="gui-rolling") {
-  $cmdId = Run-Cli @(
-    "ssm","send-command",
-    "--region",$region,
-    "--instance-ids",$iid,
-    "--document-name","AWS-RunShellScript",
-    "--comment",$comment,
-    "--parameters","commands=$([Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($commands))",
-    "--query","Command.CommandId","--output","text"
+# 작은따옴표 이스케이프 대신 Base64 인코딩으로 안전 실행
+function Build-BashOneLiner([string]$script) {
+  # ✅ 줄바꿈 정규화: CRLF/CR -> LF
+  $unix = ($script -replace "`r`n","`n" -replace "`r","")
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($unix)
+  $b64   = [Convert]::ToBase64String($bytes)
+  # ✅ bash로 명시 실행
+  return "bash -lc 'echo $b64 | base64 -d | /usr/bin/env bash -s'"
+}
+
+
+
+function Invoke-SSMScript(
+  [Parameter(Mandatory)] [string]$Region,
+  [Parameter(Mandatory)] [string]$InstanceId,
+  [Parameter(Mandatory)] [string]$Script,
+  [string]$Comment = "gui-rolling"
+) {
+  try {
+    $cmd = Build-BashOneLiner $Script
+
+   $resp = Send-SSMCommand `
+          -Region $Region `
+          -InstanceId $InstanceId `
+          -DocumentName 'AWS-RunShellScript' `
+          -Comment $Comment `
+          -Parameter @{ commands = @($cmd) }
+
+    # 다양한 모듈/버전에 견고하게 대응
+    $cmdId =
+        if ($resp.PSObject.Properties['CommandId']) { $resp.CommandId }
+        elseif ($resp.PSObject.Properties['Command'] -and $resp.Command.PSObject.Properties['CommandId']) { $resp.Command.CommandId }
+        else { $null }
+
+    if (-not $cmdId) {
+      throw "Send-SSMCommand returned no CommandId. Raw: $($resp | ConvertTo-Json -Depth 8)"
+    }
+
+    return $cmdId
+
+  }
+  catch {
+    Append-Log "Invoke-SSMScript error: $_" "ERROR"
+    throw
+  }
+}
+
+function Get-SSMInvocationDetails {
+  param(
+    [Parameter(Mandatory)] [string]$Region,
+    [Parameter(Mandatory)] [string]$InstanceId,
+    [Parameter(Mandatory)] [string]$CommandId
   )
-  $cmdId.Trim()
+  try {
+    # -Details 가 핵심: 플러그인(aws:runShellScript)별 상태/출력 확보
+    $inv = Get-SSMCommandInvocation -Region $Region -CommandId $CommandId -InstanceId $InstanceId -Details $true -ErrorAction Stop
+
+    Append-Log "SSM Invocation Summary => Status: $($inv.Status), StatusDetails: $($inv.StatusDetails), ResponseCode: $($inv.ResponseCode)" "INFO"
+
+    if ($inv.CommandPlugins) {
+      foreach ($pl in $inv.CommandPlugins) {
+        Append-Log ("Plugin: {0} | Status: {1} | Code: {2} | Name: {3}" -f $pl.Name, $pl.Status, $pl.ResponseCode, $pl.OutputS3KeyPrefix) "INFO"
+        if ($pl.Output)   { Append-Log ("[Plugin-Output]\n" + $pl.Output.Trim()) }
+        if ($pl.StandardOutputContent) { Append-Log ("[StdOut]\n" + $pl.StandardOutputContent.Trim()) }
+        if ($pl.StandardErrorContent)  { Append-Log ("[StdErr]\n" + $pl.StandardErrorContent.Trim()) "WARN" }
+      }
+    } else {
+      # 구버전 모듈/에이전트일 때 대비
+      if ($inv.StandardOutputContent) { Append-Log ("[StdOut]\n" + $inv.StandardOutputContent.Trim()) }
+      if ($inv.StandardErrorContent)  { Append-Log ("[StdErr]\n" + $inv.StandardErrorContent.Trim()) "WARN" }
+    }
+  } catch {
+    Append-Log "Get-SSMInvocationDetails error: $_" "ERROR"
+  }
 }
-function Wait-SSM([string]$region,[string]$iid,[string]$cmdId) {
-  Append-Log "Waiting SSM command $cmdId on $iid ..."
-  Run-Cli @("ssm","wait","command-executed","--region",$region,"--command-id",$cmdId,"--instance-id",$iid) | Out-Null
+
+
+function Wait-SSMCommand {
+  param(
+    [Parameter(Mandatory)] [string]$Region,
+    [Parameter(Mandatory)] [string]$InstanceId,
+    [Parameter(Mandatory)] [string]$CommandId,
+    [int]$TimeoutSeconds = 900
+  )
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  do {
+    Start-Sleep -Seconds 3
+    $inv = Get-SSMCommandInvocation -Region $Region -CommandId $CommandId -InstanceId $InstanceId -ErrorAction SilentlyContinue
+    if ($inv -and $inv.Status -in 'Success','Failed','Cancelled','TimedOut') {
+      # ✅ 종료상태면 상세 로그 남김
+      Get-SSMInvocationDetails -Region $Region -InstanceId $InstanceId -CommandId $CommandId | Out-Null
+      return $inv
+    }
+  } while ($sw.Elapsed.TotalSeconds -lt $TimeoutSeconds)
+  throw "SSM command timeout after $TimeoutSeconds seconds"
 }
+
+
 
 function Deregister-Target([string]$region,[string]$tg,[string]$iid) {
   Append-Log "Deregister $iid from TG ..."
-  Run-Cli @("elbv2","deregister-targets","--region",$region,"--target-group-arns",$tg,"--targets","Id=$iid") | Out-Null
-  Run-Cli @("elbv2","wait","target-deregistered","--region",$region,"--target-group-arns",$tg,"--targets","Id=$iid") | Out-Null
+  Run-Cli @("elbv2","deregister-targets","--region",$region,"--target-group-arn",$tg,"--targets","Id=$iid") | Out-Null
+  Run-Cli @("elbv2","wait","target-deregistered","--region",$region,"--target-group-arn",$tg,"--targets","Id=$iid") | Out-Null
 }
 function Register-Target([string]$region,[string]$tg,[string]$iid) {
   Append-Log "Register $iid to TG ..."
-  Run-Cli @("elbv2","register-targets","--region",$region,"--target-group-arns",$tg,"--targets","Id=$iid") | Out-Null
-  Run-Cli @("elbv2","wait","target-in-service","--region",$region,"--target-group-arns",$tg,"--targets","Id=$iid") | Out-Null
+  Run-Cli @("elbv2","register-targets","--region",$region,"--target-group-arn",$tg,"--targets","Id=$iid") | Out-Null
+  Run-Cli @("elbv2","wait","target-in-service","--region",$region,"--target-group-arn",$tg,"--targets","Id=$iid") | Out-Null
 }
 
 # ---------- Buttons ----------
@@ -220,9 +346,23 @@ $btnRun.Add_Click({
       Deregister-Target $region $tg $iid
 
       $script = Build-EnsureStartScript $dir $repo $port $health
-      $cmdId  = Invoke-SSM $region $iid $script "ensure+start $dir"
-      Wait-SSM $region $iid $cmdId
-      Append-Log "App started & health OK on $iid"
+
+      # ★ SSM 모듈 방식으로 호출
+      $cmdId = Invoke-SSMScript -Region $region -InstanceId $iid -Script $script -Comment "ensure+start $dir"
+      Append-Log "SSM CommandId: $cmdId"
+
+      $inv = Wait-SSMCommand -Region $region -InstanceId $iid -CommandId $cmdId -TimeoutSeconds 900
+
+    # 이 시점에 상세 로그는 이미 Append-Log 로 찍힘.
+    if ($inv.Status -ne 'Success') {
+        # StatusDetails 빈칸 대응 위해 보조 메시지 추가
+        $detail = if ($inv.StatusDetails) { $inv.StatusDetails } else { "(no StatusDetails)" }
+        $code   = if ($inv.ResponseCode -ne $null) { $inv.ResponseCode } else { "(no code)" }
+        throw ("SSM failed on {0}: {1} ({2})" -f $iid, $detail, $code)
+    }
+
+      if ($inv.StandardOutputContent) { Append-Log ($inv.StandardOutputContent.Trim()) }
+      if ($inv.StandardErrorContent)  { Append-Log ($inv.StandardErrorContent.Trim()) "WARN" }
 
       Register-Target $region $tg $iid
       Append-Log "DONE for $iid"
@@ -235,5 +375,6 @@ $btnRun.Add_Click({
     $btnRun.Enabled = $true; $btnValidate.Enabled = $true
   }
 })
+
 
 [void]$form.ShowDialog()
